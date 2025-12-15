@@ -4,222 +4,286 @@ import numpy as np
 import scipy.stats as stats
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="BioStats Meta-App", layout="wide")
+st.set_page_config(page_title="Genetic Epi Suite", layout="wide")
 
-# --- HELPER FUNCTIONS ---
-def calculate_or_stats(a, b, c, d):
-    """Calculates OR, SE, 95% CI, Chi2, and P-value."""
-    # Haldane correction for zero cells
-    if any(x == 0 for x in [a, b, c, d]):
-        a, b, c, d = a + 0.5, b + 0.5, c + 0.5, d + 0.5
-
-    # Odds Ratio
-    try:
-        or_val = (a * d) / (b * c)
-        log_or = np.log(or_val)
-        se_log_or = np.sqrt(1/a + 1/b + 1/c + 1/d)
-        lower_ci = np.exp(log_or - 1.96 * se_log_or)
-        upper_ci = np.exp(log_or + 1.96 * se_log_or)
-    except:
-        return None
-
-    # Chi-Square
-    obs = np.array([[a, b], [c, d]])
-    chi2, p_val, _, _ = stats.chi2_contingency(obs, correction=False)
-
-    return {
-        "OR": or_val, "Log_OR": log_or, "SE": se_log_or,
-        "CI_Lower": lower_ci, "CI_Upper": upper_ci,
-        "Chi2": chi2, "P_Value": p_val
-    }
+# --- UTILITY FUNCTIONS ---
 
 def calculate_hwe(aa, aa_het, aa_homo):
-    """Calculates Hardy-Weinberg Equilibrium."""
+    """Calculates HWE P-value for Controls."""
     total = aa + aa_het + aa_homo
-    if total == 0: return None
-    
-    # Alelle frequencies
-    p = (2 * aa + aa_het) / (2 * total)
-    q = 1 - p
-    
-    # Expected counts
+    if total == 0: return 1.0
+    p = (2 * aa + aa_het) / (2 * total) # Major allele freq
+    q = 1 - p # Minor allele freq
     exp_aa = (p ** 2) * total
     exp_het = (2 * p * q) * total
     exp_homo = (q ** 2) * total
-    
-    # Chi-Square for HWE
     obs = [aa, aa_het, aa_homo]
     exp = [exp_aa, exp_het, exp_homo]
+    # Simple Chi-square for HWE
     chi2, p_val = stats.chisquare(obs, f_exp=exp)
+    return p_val
+
+def genetic_model_calc(a, b, c, d, model_name):
+    """
+    Generic 2x2 Calculator for any model.
+    Input: a (Case Exp), b (Ctrl Exp), c (Case Unexp), d (Ctrl Unexp)
+    """
+    # Haldane correction
+    if any(x == 0 for x in [a, b, c, d]):
+        a, b, c, d = a + 0.5, b + 0.5, c + 0.5, d + 0.5
     
-    return {"Chi2": chi2, "P_Value": p_val, "Exp": exp}
-
-# --- UI LAYOUT ---
-st.title("🧬 BioStats: Meta-Analysis & Calculator")
-
-tab1, tab2, tab3 = st.tabs(["🧮 Single Study Calculator", "📊 Meta-Analysis", "📈 Meta-Regression"])
-
-# ==========================================
-# TAB 1: SINGLE STUDY CALCULATOR
-# ==========================================
-with tab1:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Association Test (2x2 Table)")
-        c1, c2 = st.columns(2)
-        a = c1.number_input("Cases Exposed (a)", min_value=0, value=10)
-        b = c2.number_input("Controls Exposed (b)", min_value=0, value=20)
-        c = c1.number_input("Cases Unexposed (c)", min_value=0, value=15)
-        d = c2.number_input("Controls Unexposed (d)", min_value=0, value=35)
+    try:
+        odds_ratio = (a * d) / (b * c)
+        log_or = np.log(odds_ratio)
+        se = np.sqrt(1/a + 1/b + 1/c + 1/d)
+        ci_lower = np.exp(log_or - 1.96 * se)
+        ci_upper = np.exp(log_or + 1.96 * se)
         
-        if st.button("Calculate Association"):
-            res = calculate_or_stats(a, b, c, d)
-            if res:
-                st.success(f"**Odds Ratio:** {res['OR']:.4f} [{res['CI_Lower']:.4f} - {res['CI_Upper']:.4f}]")
-                st.info(f"**P-Value:** {res['P_Value']:.4e} | **Chi²:** {res['Chi2']:.4f}")
-            else:
-                st.error("Invalid calculation (check for zeros).")
-
-    with col2:
-        st.subheader("Hardy-Weinberg Equilibrium (HWE)")
-        g1 = st.number_input("Homozygous Major (AA)", min_value=0, value=50)
-        g2 = st.number_input("Heterozygous (Aa)", min_value=0, value=30)
-        g3 = st.number_input("Homozygous Minor (aa)", min_value=0, value=10)
+        # Chi-Square & Fisher
+        obs = np.array([[a, b], [c, d]])
+        chi2, p_chi2, dof, _ = stats.chi2_contingency(obs, correction=False)
+        _, p_fisher = stats.fisher_exact(obs)
         
-        if st.button("Check HWE"):
-            hwe = calculate_hwe(g1, g2, g3)
-            st.write(f"**HWE P-Value:** {hwe['P_Value']:.4f}")
-            if hwe['P_Value'] < 0.05:
-                st.warning("⚠️ Deviation from HWE detected.")
-            else:
-                st.success("✅ Consistent with HWE.")
+        return {
+            "Model": model_name,
+            "OR": odds_ratio, "CI95": f"{ci_lower:.2f}-{ci_upper:.2f}",
+            "Chi2": chi2, "P_Value": p_chi2, "Fisher_P": p_fisher,
+            "Log_OR": log_or, "SE": se
+        }
+    except:
+        return None
+
+def eggers_test(effect_sizes, standard_errors):
+    """
+    Performs Egger's test for publication bias.
+    Regress Standardized Effect (Estimate/SE) against Precision (1/SE).
+    """
+    try:
+        y = np.array(effect_sizes) / np.array(standard_errors)
+        x = 1 / np.array(standard_errors)
+        X = sm.add_constant(x)
+        model = sm.OLS(y, X).fit()
+        return model.pvalues[0] # P-value of the intercept
+    except:
+        return np.nan
+
+# --- APP LAYOUT ---
+
+st.title("🧬 Comprehensive Genetic Association Suite")
+st.markdown("Supports: Descriptive Stats, 6 Genetic Models, Meta-Analysis & Bias Assessment")
+
+tabs = st.tabs([
+    "📋 1. Descriptive Stats", 
+    "🧬 2. Genetic Models (YAP1/2)", 
+    "📊 3. Meta-Analysis & Bias",
+    "⚖️ 4. Confounder & Risk of Bias"
+])
 
 # ==========================================
-# TAB 2: META-ANALYSIS
+# TAB 1: DESCRIPTIVE STATISTICS (Raw Data)
 # ==========================================
-with tab2:
-    st.markdown("### Upload Data for Meta-Analysis")
-    st.caption("CSV must have columns: `StudyName`, `a`, `b`, `c`, `d`")
+with tabs[0]:
+    st.header("Clinical Characteristics (Control vs Patient)")
+    st.info("Upload RAW data. Columns required: `Group` (must contain 'Control' and 'Case'), and numeric columns (Age, BMI, etc.)")
     
-    # Demo Data Creator
-    demo_data = pd.DataFrame({
-        'StudyName': ['Study 1', 'Study 2', 'Study 3', 'Study 4'],
-        'a': [10, 20, 15, 40],
-        'b': [20, 30, 25, 50],
-        'c': [15, 25, 20, 45],
-        'd': [35, 45, 40, 60]
-    })
+    uploaded_clin = st.file_uploader("Upload Clinical Data (CSV)", key="clin")
     
-    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-    
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-    else:
-        st.info("Using demo data. Upload your own CSV to override.")
-        df = demo_data
-
-    st.dataframe(df.head(), use_container_width=True)
-
-    if st.button("Run Meta-Analysis"):
-        # 1. Calculate Effects for all rows
-        results = []
-        for idx, row in df.iterrows():
-            res = calculate_or_stats(row['a'], row['b'], row['c'], row['d'])
-            if res:
+    if uploaded_clin:
+        df_clin = pd.read_csv(uploaded_clin)
+        st.write("Preview:", df_clin.head())
+        
+        if 'Group' in df_clin.columns:
+            controls = df_clin[df_clin['Group'] == 'Control']
+            cases = df_clin[df_clin['Group'] == 'Case']
+            
+            st.subheader("Statistical Comparison (Student's t-test)")
+            
+            # Select numeric columns automatically
+            numeric_cols = df_clin.select_dtypes(include=np.number).columns.tolist()
+            
+            results = []
+            for col in numeric_cols:
+                mean_ctrl = controls[col].mean()
+                std_ctrl = controls[col].std()
+                mean_case = cases[col].mean()
+                std_case = cases[col].std()
+                
+                # T-test
+                t_stat, p_val = stats.ttest_ind(controls[col].dropna(), cases[col].dropna())
+                
                 results.append({
-                    'Study': row.get('StudyName', f'Study {idx+1}'),
-                    'Log_OR': res['Log_OR'],
-                    'SE': res['SE'],
-                    'OR': res['OR'],
-                    'Lower': res['CI_Lower'],
-                    'Upper': res['CI_Upper']
+                    "Variable": col,
+                    "Control (Mean ± SD)": f"{mean_ctrl:.2f} ± {std_ctrl:.2f}",
+                    "Case (Mean ± SD)": f"{mean_case:.2f} ± {std_case:.2f}",
+                    "P-Value": p_val
                 })
-        
-        meta_df = pd.DataFrame(results)
-        
-        # 2. Fixed Effects Model (Inverse Variance)
-        weights = 1 / (meta_df['SE'] ** 2)
-        pooled_log_or = np.sum(weights * meta_df['Log_OR']) / np.sum(weights)
-        pooled_se = np.sqrt(1 / np.sum(weights))
-        
-        pooled_or = np.exp(pooled_log_or)
-        pooled_lower = np.exp(pooled_log_or - 1.96 * pooled_se)
-        pooled_upper = np.exp(pooled_log_or + 1.96 * pooled_se)
-
-        # Display Results
-        st.divider()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Pooled Odds Ratio", f"{pooled_or:.3f}")
-        c2.metric("95% CI", f"{pooled_lower:.3f} - {pooled_upper:.3f}")
-        
-        # Heterogeneity (Cochran's Q)
-        q_stat = np.sum(weights * (meta_df['Log_OR'] - pooled_log_or)**2)
-        df_q = len(meta_df) - 1
-        p_het = 1 - stats.chi2.cdf(q_stat, df_q)
-        c3.metric("Heterogeneity P-value", f"{p_het:.4f}")
-
-        # 3. Forest Plot (Matplotlib)
-        st.subheader("Forest Plot")
-        fig, ax = plt.subplots(figsize=(8, 4))
-        
-        y_pos = np.arange(len(meta_df))
-        ax.errorbar(meta_df['OR'], y_pos, xerr=[meta_df['OR']-meta_df['Lower'], meta_df['Upper']-meta_df['OR']], 
-                    fmt='o', color='blue', label='Studies')
-        
-        # Add Pooled Diamond (approximated as a point for this demo)
-        ax.errorbar(pooled_or, -1, xerr=[[pooled_or-pooled_lower], [pooled_upper-pooled_or]], 
-                    fmt='D', color='red', label='Pooled Estimate')
-        
-        ax.set_yticks(list(y_pos) + [-1])
-        ax.set_yticklabels(list(meta_df['Study']) + ['Pooled'])
-        ax.axvline(x=1, color='gray', linestyle='--')
-        ax.set_xlabel("Odds Ratio (log scale)")
-        ax.set_xscale('log')
-        ax.legend()
-        
-        st.pyplot(fig)
+            
+            st.table(pd.DataFrame(results))
+        else:
+            st.error("Column 'Group' not found in CSV.")
 
 # ==========================================
-# TAB 3: META-REGRESSION
+# TAB 2: GENETIC MODELS (Summary Data)
 # ==========================================
-with tab3:
-    st.markdown("### Meta-Regression")
-    st.info("Requires a 'Year' column in your dataset.")
+with tabs[1]:
+    st.header("Genotypic Association Models")
+    st.markdown("Upload 'genotypic ratio_YAP1' or 'YAP2'. Required cols: `Study`, `AA_case`, `Aa_case`, `aa_case`, `AA_ctrl`, `Aa_ctrl`, `aa_ctrl`")
     
-    # Add dummy year to demo data
-    if 'Year' not in df.columns:
-        df['Year'] = [2010, 2012, 2015, 2018][:len(df)]
-        
-    if st.checkbox("Show Regression Data"):
-        st.dataframe(df)
+    # Template download
+    template = pd.DataFrame({
+        'Study': ['Study1'], 
+        'AA_case': [10], 'Aa_case': [20], 'aa_case': [5],
+        'AA_ctrl': [15], 'Aa_ctrl': [25], 'aa_ctrl': [10]
+    })
+    st.download_button("📥 Download Template", template.to_csv(index=False), "genotype_template.csv")
 
-    if st.button("Run Regression (Year vs Log OR)"):
-        # Calculate Log ORs again
-        y_vals = [] # Effect sizes (Log OR)
-        w_vals = [] # Weights (1/variance)
-        x_vals = [] # Moderator (Year)
+    geno_file = st.file_uploader("Upload Genotype Data", key="geno")
+    
+    if geno_file:
+        df_g = pd.read_csv(geno_file)
         
-        for idx, row in df.iterrows():
-            res = calculate_or_stats(row['a'], row['b'], row['c'], row['d'])
-            if res:
-                y_vals.append(res['Log_OR'])
-                w_vals.append(1/(res['SE']**2))
-                x_vals.append(row['Year'])
+        # Calculate Allele Counts
+        # Case Alleles
+        df_g['A_case'] = 2*df_g['AA_case'] + df_g['Aa_case']
+        df_g['a_case'] = 2*df_g['aa_case'] + df_g['Aa_case']
+        # Control Alleles
+        df_g['A_ctrl'] = 2*df_g['AA_ctrl'] + df_g['Aa_ctrl']
+        df_g['a_ctrl'] = 2*df_g['aa_ctrl'] + df_g['Aa_ctrl']
+        
+        # Store all results for display
+        model_results = []
 
-        # Weighted Least Squares (WLS) using Statsmodels
-        X = sm.add_constant(x_vals) # Add intercept
-        model = sm.WLS(y_vals, X, weights=w_vals)
-        reg_results = model.fit()
+        for idx, row in df_g.iterrows():
+            study = row.get('Study', f'Study {idx+1}')
+            
+            # 1. HWE (Controls)
+            hwe_p = calculate_hwe(row['AA_ctrl'], row['Aa_ctrl'], row['aa_ctrl'])
+            
+            # --- DEFINE MODELS ---
+            models = [
+                # Allelic: A vs a
+                ("Allelic (A vs a)", row['A_case'], row['A_ctrl'], row['a_case'], row['a_ctrl']),
+                
+                # Dominant: (AA + Aa) vs aa
+                ("Dominant (AA+Aa vs aa)", 
+                 row['AA_case']+row['Aa_case'], row['AA_ctrl']+row['Aa_ctrl'], 
+                 row['aa_case'], row['aa_ctrl']),
+                 
+                # Recessive: AA vs (Aa + aa)
+                ("Recessive (AA vs Aa+aa)", 
+                 row['AA_case'], row['AA_ctrl'], 
+                 row['Aa_case']+row['aa_case'], row['Aa_ctrl']+row['aa_ctrl']),
+                 
+                # Overdominant: Aa vs (AA + aa)
+                ("Overdominant (Aa vs AA+aa)", 
+                 row['Aa_case'], row['Aa_ctrl'], 
+                 row['AA_case']+row['aa_case'], row['AA_ctrl']+row['aa_ctrl'])
+            ]
+            
+            for m_name, a, b, c, d in models:
+                res = genetic_model_calc(a, b, c, d, m_name)
+                if res:
+                    res['Study'] = study
+                    res['HWE_P_Ctrl'] = hwe_p
+                    model_results.append(res)
+
+        df_res = pd.DataFrame(model_results)
         
-        st.write(reg_results.summary())
+        st.subheader("Model Results per Study")
+        st.dataframe(df_res)
         
-        # Plot
-        fig2, ax2 = plt.subplots()
-        ax2.scatter(x_vals, y_vals, s=[w*5 for w in w_vals], alpha=0.6)
-        ax2.plot(x_vals, reg_results.predict(X), color='red', label='Regression Line')
-        ax2.set_xlabel("Year")
-        ax2.set_ylabel("Log Odds Ratio")
-        st.pyplot(fig2)
+        # Store in session state for Meta-Analysis
+        st.session_state['genetics_results'] = df_res
+
+# ==========================================
+# TAB 3: META-ANALYSIS & BIAS
+# ==========================================
+with tabs[2]:
+    st.header("Meta-Analysis & Bias Assessment")
+    
+    if 'genetics_results' in st.session_state:
+        df_meta = st.session_state['genetics_results']
+        
+        # Filter by Model
+        model_choice = st.selectbox("Select Genetic Model to Meta-Analyze", df_meta['Model'].unique())
+        subset = df_meta[df_meta['Model'] == model_choice].copy()
+        
+        if not subset.empty:
+            # Pooled Calculations (Fixed Effects - Inverse Variance)
+            weights = 1 / (subset['SE'] ** 2)
+            pooled_log_or = np.sum(weights * subset['Log_OR']) / np.sum(weights)
+            pooled_se = np.sqrt(1 / np.sum(weights))
+            pooled_or = np.exp(pooled_log_or)
+            
+            # Heterogeneity (I^2)
+            q_stat = np.sum(weights * (subset['Log_OR'] - pooled_log_or)**2)
+            df_q = len(subset) - 1
+            p_het = 1 - stats.chi2.cdf(q_stat, df_q)
+            i2 = max(0, (q_stat - df_q) / q_stat) * 100 if q_stat > df_q else 0
+            
+            # Egger's Test
+            egger_p = eggers_test(subset['Log_OR'], subset['SE'])
+            
+            # Display Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Pooled OR", f"{pooled_or:.2f}")
+            c2.metric("Heterogeneity (I²)", f"{i2:.1f}%")
+            c3.metric("Het P-Value", f"{p_het:.4f}")
+            c4.metric("Egger's Bias P", f"{egger_p:.4f}")
+            
+            # Begg's Test Note
+            st.caption("*Begg's test (Rank Correlation) requires larger sample sizes; Egger's is prioritized here.*")
+            
+            # Forest Plot
+            st.subheader("Forest Plot")
+            fig, ax = plt.subplots(figsize=(8, len(subset)*0.5 + 2))
+            y_pos = np.arange(len(subset))
+            ax.errorbar(subset['OR'], y_pos, xerr=[subset['OR']-(np.exp(subset['Log_OR']-1.96*subset['SE'])), 
+                                                   (np.exp(subset['Log_OR']+1.96*subset['SE']))-subset['OR']],
+                        fmt='o', color='black')
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(subset['Study'])
+            ax.axvline(x=1, color='red', linestyle='--')
+            ax.set_xlabel("Odds Ratio (Log Scale)")
+            ax.set_xscale('log')
+            st.pyplot(fig)
+            
+            # Heatmap (Correlation of metrics)
+            st.subheader("Parameter Heatmap")
+            corr_data = subset[['OR', 'P_Value', 'HWE_P_Ctrl', 'Chi2']].astype(float)
+            fig2, ax2 = plt.subplots()
+            sns.heatmap(corr_data.corr(), annot=True, cmap='coolwarm', ax=ax2)
+            st.pyplot(fig2)
+
+    else:
+        st.warning("Please calculate models in Tab 2 first.")
+
+# ==========================================
+# TAB 4: CONFOUNDER & RISK OF BIAS
+# ==========================================
+with tabs[3]:
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        st.header("Confounder Analysis (Logistic Reg)")
+        st.info("Requires raw patient data with columns: Outcome (0/1), Genotype (0/1/2), Age, BMI")
+        # Placeholder for Logistic Regression implementation
+        st.text("Upload raw data to perform: \nlogit(Outcome) ~ Genotype + Age + BMI")
+        
+    with c2:
+        st.header("Newcastle–Ottawa Scale (NOS)")
+        st.write("Rate the quality of your studies manually:")
+        
+        selection = st.slider("Selection (0-4 stars)", 0, 4, 3)
+        comparability = st.slider("Comparability (0-2 stars)", 0, 2, 1)
+        exposure = st.slider("Exposure/Outcome (0-3 stars)", 0, 3, 2)
+        
+        total_score = selection + comparability + exposure
+        st.metric("Total NOS Score", f"{total_score} / 9")
+        
+        if total_score >= 7:
+            st.success("High Quality Study")
+        else:
+            st.warning("High Risk of Bias")
