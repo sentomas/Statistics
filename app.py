@@ -7,7 +7,7 @@ from statsmodels.formula.api import ols, logit
 import matplotlib.pyplot as plt
 import seaborn as sns
 from io import BytesIO
-import time
+import re
 
 # --- 1. CONFIGURATION & STYLING ---
 st.set_page_config(
@@ -58,14 +58,11 @@ st.markdown("""
 
 def robust_read(file):
     """Tries to read a file as CSV (various encodings) or Excel."""
-    # Reset pointer
     file.seek(0)
-    
     if file.name.endswith('.xlsx'):
         try: return pd.read_excel(file)
         except: pass
     
-    # CSV Attempts
     encodings = ['utf-8', 'ISO-8859-1', 'cp1252']
     separators = [',', '\t', ';', None]
     
@@ -76,13 +73,18 @@ def robust_read(file):
                 return pd.read_csv(file, encoding=enc, sep=sep, engine='python' if sep is None else 'c')
             except:
                 continue
-                
     st.error(f"❌ Failed to read {file.name}. Please ensure it's a valid CSV or Excel file.")
     return pd.DataFrame()
 
+def normalize_cols(df):
+    """Removes units like (kg), (cm) and extra spaces to allow matching."""
+    df.columns = df.columns.astype(str)
+    # Remove content inside parenthesis e.g., "Weight (kg)" -> "Weight"
+    new_cols = [re.sub(r'\s*\(.*\)', '', c).strip() for c in df.columns]
+    df.columns = new_cols
+    return df
+
 def calculate_or_stats(a, b, c, d, model_label):
-    """Calculates Odds Ratio, CI, and P-values for 2x2 tables."""
-    # Haldane Correction
     if any(x == 0 for x in [a, b, c, d]):
         a, b, c, d = a+0.5, b+0.5, c+0.5, d+0.5
     try:
@@ -90,11 +92,8 @@ def calculate_or_stats(a, b, c, d, model_label):
         log_or = np.log(or_val)
         se = np.sqrt(1/a + 1/b + 1/c + 1/d)
         ci_lo, ci_up = np.exp(log_or - 1.96 * se), np.exp(log_or + 1.96 * se)
-        
-        # P-value (Z-test)
         p_val = 2 * (1 - stats.norm.cdf(abs(log_or / se)))
         
-        # Chi-Square & Fisher
         obs = [[a, b], [c, d]]
         chi2, p_chi2, df, _ = stats.chi2_contingency(obs, correction=False)
         _, p_fisher = stats.fisher_exact(obs)
@@ -106,13 +105,10 @@ def calculate_or_stats(a, b, c, d, model_label):
     except: return None
 
 def eggers_test(effect, se):
-    """Performs Egger's regression test for publication bias."""
     try: 
-        # Weighted linear regression of standard normal deviate on precision
-        # y = effect/se, x = 1/se
         y = effect / se
         x = 1 / se
-        return sm.OLS(y, sm.add_constant(x)).fit().pvalues[0] # Intercept P-value
+        return sm.OLS(y, sm.add_constant(x)).fit().pvalues[0]
     except: return 0.0
 
 # --- 3. SIDEBAR DASHBOARD ---
@@ -130,13 +126,12 @@ with st.sidebar:
     alpha = st.slider("Significance Level (α)", 0.01, 0.10, 0.05)
     
     st.info("💡 **Tip:** Use the tabs on the right to navigate between Clinical, Genetic, and Meta-Analysis modules.")
-    st.caption(f"v2.1 | Powered by GenEpi")
+    st.caption(f"v2.2 | Powered by GenEpi")
 
 # --- 4. MAIN INTERFACE ---
 st.title(f"🧬 GenEpi Analytics: {study_name}")
 st.markdown(f"**Investigator:** {investigator} | **Date:** {pd.Timestamp.now().strftime('%Y-%m-%d')}")
 
-# Tabs with Icons
 tabs = st.tabs([
     "🏥 Clinical Stats", 
     "🧬 Genetic Models", 
@@ -150,7 +145,6 @@ tabs = st.tabs([
 # ==========================================
 with tabs[0]:
     st.markdown("### 📊 Descriptive Statistics")
-    st.markdown("Compare baseline characteristics between Case and Control groups.")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -165,12 +159,35 @@ with tabs[0]:
             df_case = robust_read(f_case)
             df_ctrl = robust_read(f_ctrl)
             
-            # Identify Numeric Columns
+            # Save original for heatmap
+            df_case_orig = df_case.copy()
+            
+            # Normalize for matching
+            df_case = normalize_cols(df_case)
+            df_ctrl = normalize_cols(df_ctrl)
+            
+            # Identify Numeric Columns in both
             num_cols = list(set(df_case.select_dtypes(include=np.number).columns) & 
                             set(df_ctrl.select_dtypes(include=np.number).columns))
             
+            # --- Heatmap Section (Using ALL Case Data) ---
+            st.divider()
+            st.subheader("Correlation Heatmap (All Case Variables)")
+            
+            # Use original case dataframe to keep all variables, even those missing in controls
+            case_numeric = df_case_orig.select_dtypes(include=np.number)
+            
+            if not case_numeric.empty:
+                fig, ax = plt.subplots(figsize=(10, 8))
+                sns.heatmap(case_numeric.corr(), annot=True, cmap='coolwarm', fmt=".2f", ax=ax)
+                st.pyplot(fig)
+            else:
+                st.warning("No numeric columns found in Case file for heatmap.")
+                
+            # --- T-Test Comparison Section ---
             if num_cols:
-                # Results Calculation
+                st.divider()
+                st.subheader("Case vs Control Comparison")
                 res_clin = []
                 for col in num_cols:
                     vc, vt = df_case[col].dropna(), df_ctrl[col].dropna()
@@ -187,23 +204,14 @@ with tabs[0]:
                 
                 df_res = pd.DataFrame(res_clin).sort_values("P-Value")
                 st.session_state['clin_results'] = df_res
-
-                # Display Logic
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    st.subheader("Statistical Comparison (T-Test)")
-                    st.dataframe(
-                        df_res.style.format({"P-Value": "{:.4f}"})
-                        .background_gradient(subset=['P-Value'], cmap="Reds_r", vmin=0, vmax=0.1),
-                        use_container_width=True, height=400
-                    )
-                with c2:
-                    st.subheader("Correlation Heatmap (Cases)")
-                    fig, ax = plt.subplots(figsize=(5, 4))
-                    sns.heatmap(df_case[num_cols].corr(), annot=False, cmap='coolwarm', cbar=False, ax=ax)
-                    st.pyplot(fig)
+                
+                st.dataframe(
+                    df_res.style.format({"P-Value": "{:.4f}"})
+                    .background_gradient(subset=['P-Value'], cmap="Reds_r", vmin=0, vmax=0.1),
+                    use_container_width=True
+                )
             else:
-                st.warning("⚠️ No common numeric columns found between files.")
+                st.warning("⚠️ No matching numeric columns found between files even after normalization.")
 
 # ==========================================
 # TAB 2: GENETIC MODELS
@@ -211,7 +219,6 @@ with tabs[0]:
 with tabs[1]:
     st.markdown("### 🧬 Genotype Association Models")
     
-    # Dataset Selector
     DEFAULT_GENO = {
         "YAP1 (rs11225161)": {"Case": [89, 29, 82], "Ctrl": [132, 17, 51], "Alleles": ["C", "T"]},
         "YAP2 (rs11225138)": {"Case": [52, 16, 132], "Ctrl": [109, 27, 64], "Alleles": ["G", "C"]}
@@ -222,7 +229,6 @@ with tabs[1]:
         snp = st.selectbox("Select Target SNP", list(DEFAULT_GENO.keys()))
         d = DEFAULT_GENO[snp]
     
-    # Interactive Input Grid
     with st.expander("✏️ Edit Genotype Counts (Observed)", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
@@ -236,7 +242,6 @@ with tabs[1]:
             co_het = st.number_input("Het", value=d["Ctrl"][1], key="ct2")
             co_hom2 = st.number_input("Hom Risk", value=d["Ctrl"][2], key="ct3")
 
-    # QC Metrics
     with col_kpi:
         n_ctrl = co_hom1 + co_het + co_hom2
         p_freq = (2*co_hom1 + co_het) / (2*n_ctrl)
@@ -248,7 +253,6 @@ with tabs[1]:
         k2.metric("HWE P-Value", f"{hwe_p:.4f}", delta="Pass" if hwe_p > 0.05 else "Fail", delta_color="normal")
         k3.metric("Risk Allele", d["Alleles"][1])
 
-    # Run Models
     models = [
         calculate_or_stats(2*ca_hom2+ca_het, 2*co_hom2+co_het, 2*ca_hom1+ca_het, 2*co_hom1+co_het, "Allelic (A vs a)"),
         calculate_or_stats(ca_hom2, co_hom2, ca_hom1, co_hom1, "Genotypic (aa vs AA)"),
