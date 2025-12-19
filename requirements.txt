@@ -5,4 +5,5 @@ scipy
 statsmodels
 matplotlib
 seaborn
+python-docx
 openpyxl
